@@ -12,8 +12,7 @@ def read(*parts):
 
 
 setup(
-    version=versioneer.get_version(),
-    cmdclass=versioneer.get_cmdclass(),
+    version='0.9.2.chevah2',
     name='txacme',
     description='ACME protocol implementation for Twisted',
     license='Expat',
@@ -51,7 +50,7 @@ setup(
         'josepy',
         'pem>=16.1.0',
         'treq>=15.1.0',
-        'twisted[tls]>=15.5.0',
+        'twisted',
         'txsni',
         'pyopenssl>=17.1.0',
         ],

@@ -65,7 +65,7 @@ class AcmeIssuingService(Service):
         key generation requirements.
     """
     cert_store = attr.ib()
-    _client_creator = attr.ib()
+    _client = attr.ib()
     _clock = attr.ib()
     _responders = attr.ib()
     _email = attr.ib(default=None)
@@ -78,6 +78,8 @@ class AcmeIssuingService(Service):
     _waiting = attr.ib(default=attr.Factory(list), init=False)
     _issuing = attr.ib(default=attr.Factory(dict), init=False)
     ready = False
+    _timer_service = None
+    _registered = False
 
     def _now(self):
         """
@@ -115,17 +117,14 @@ class AcmeIssuingService(Service):
 
             d1 = (
                 gatherResults(
-                    [self._with_client(self._issue_cert, server_name)
+                    [self._issue_cert(server_name)
                      .addErrback(self._panic, server_name)
                      for server_name in panicing],
                     consumeErrors=True)
                 .addCallback(done_panicing))
             d2 = gatherResults(
                 [self.issue_cert(server_name)
-                 .addErrback(
-                     lambda f: log.failure(
-                         u'Error issuing certificate for: {server_name!r}',
-                         f, server_name=server_name))
+                 .addErrback(self._eb_check_expiring, server_name)
                  for server_name in expiring],
                 consumeErrors=True)
             return gatherResults([d1, d2], consumeErrors=True)
@@ -140,9 +139,23 @@ class AcmeIssuingService(Service):
             self._ensure_registered()
             .addCallback(lambda _: self.cert_store.as_dict())
             .addCallback(check)
-            .addErrback(
-                lambda f: log.failure(
-                    u'Error in scheduled certificate check.', f)))
+            .addErrback(self._eb_check_certs))
+
+    def _eb_check_expiring(self, failure, server_name):
+        """
+        Called when failing to renew a certificate which is about to expire.
+        """
+        log.failure(
+            u'Error issuing certificate for: {server_name!r}',
+            failure,
+            server_name=server_name,
+            )
+
+    def _eb_check_certs(self, failure):
+        """
+        Called when updating the certificates fails.
+        """
+        log.failure(u'Error in scheduled certificate check.', failure)
 
     def issue_cert(self, server_name):
         """
@@ -169,7 +182,7 @@ class AcmeIssuingService(Service):
             d_issue, waiting = self._issuing[server_name]
             waiting.append(d)
         else:
-            d_issue = self._with_client(self._issue_cert, server_name)
+            d_issue = self._issue_cert(server_name)
             waiting = [d]
             self._issuing[server_name] = (d_issue, waiting)
             # Add the callback afterwards in case we're using a client
@@ -177,13 +190,7 @@ class AcmeIssuingService(Service):
             d_issue.addBoth(finish)
         return d
 
-    def _with_client(self, f, *a, **kw):
-        """
-        Construct a client, and perform an operation with it.
-        """
-        return self._client_creator().addCallback(f, *a, **kw)
-
-    def _issue_cert(self, client, server_name):
+    def _issue_cert(self, server_name):
         """
         Issue a new cert for a particular name.
         """
@@ -200,10 +207,10 @@ class AcmeIssuingService(Service):
         def answer_and_poll(authzr):
             def got_challenge(stop_responding):
                 return (
-                    poll_until_valid(authzr, self._clock, client)
+                    poll_until_valid(authzr, self._clock, self._client)
                     .addBoth(tap(lambda _: stop_responding())))
             return (
-                answer_challenge(authzr, client, self._responders)
+                answer_challenge(authzr, self._client, self._responders)
                 .addCallback(got_challenge))
 
         def got_cert(certr):
@@ -223,13 +230,13 @@ class AcmeIssuingService(Service):
             return objects
 
         return (
-            client.request_challenges(fqdn_identifier(server_name))
+            self._client.request_challenges(fqdn_identifier(server_name))
             .addCallback(answer_and_poll)
-            .addCallback(lambda ign: client.request_issuance(
+            .addCallback(lambda ign: self._client.request_issuance(
                 CertificateRequest(
                     csr=csr_for_names([server_name], key))))
             .addCallback(got_cert)
-            .addCallback(client.fetch_chain)
+            .addCallback(self._client.fetch_chain)
             .addCallback(got_chain)
             .addCallback(partial(self.cert_store.store, server_name)))
 
@@ -240,9 +247,9 @@ class AcmeIssuingService(Service):
         if self._registered:
             return succeed(None)
         else:
-            return self._with_client(self._register)
+            return self._register()
 
-    def _register(self, client):
+    def _register(self):
         """
         Register and agree to the TOS.
         """
@@ -251,8 +258,8 @@ class AcmeIssuingService(Service):
             self._registered = True
         regr = messages.NewRegistration.from_data(email=self._email)
         return (
-            client.register(regr)
-            .addCallback(client.agree_to_tos)
+            self._client.register(regr)
+            .addCallback(self._client.agree_to_tos)
             .addCallback(_registered))
 
     def when_certs_valid(self):
@@ -291,7 +298,10 @@ class AcmeIssuingService(Service):
         for d in list(self._waiting):
             d.cancel()
         self._waiting = []
-        return self._timer_service.stopService()
+        if self._timer_service:
+            return self._timer_service.stopService()
+        else:
+            return succeed(None)
 
 
 __all__ = ['AcmeIssuingService']
